@@ -24,14 +24,12 @@ def load_audio(audiopath, sampling_rate=22000):
     """
     try:
         if isinstance(audiopath, str):  # File path input
-            if audiopath.endswith('.mp3'):
-                audio, lsr = librosa.load(audiopath, sr=sampling_rate)
-                audio = torch.FloatTensor(audio)  # Convert to tensor
-            else:
-                raise ValueError(f"Unsupported audio format provided: {audiopath[-4:]}")
-        elif isinstance(audiopath, io.BytesIO):  # If in-memory file
             audio, lsr = torchaudio.load(audiopath)
-            audio = audio[0]  # Remove channel data if stereo
+            audio = audio.mean(dim=0)  # Convert stereo to mono
+        elif isinstance(audiopath, io.BytesIO):  # If in-memory file
+            audiopath.seek(0)  # Reset pointer
+            audio, lsr = torchaudio.load(audiopath)
+            audio = audio.mean(dim=0)  # Convert stereo to mono
         else:
             raise TypeError("Invalid input type. Expected file path or BytesIO object.")
 
@@ -40,9 +38,7 @@ def load_audio(audiopath, sampling_rate=22000):
             audio = resample(audio, lsr, sampling_rate)
 
         # Normalize audio
-        if torch.any(audio > 2) or torch.any(audio < -1):
-            print(f"Warning: Audio data out of range. Max={audio.max()} min={audio.min()}")
-            audio = torch.clamp(audio, -1, 1)
+        audio = audio / torch.max(torch.abs(audio))
 
         return audio.unsqueeze(0)  # Add batch dimension
     except Exception as e:
@@ -58,24 +54,39 @@ def classify_audio_clip(clip):
     :param clip: torch tensor containing the audio waveform data.
     :return: The probability of the audio clip being AI-generated.
     """
+    try:
+        # Initialize classifier model
+        classifier = AudioMiniEncoderWithClassifierHead(
+            classes=2,  # Added the required classes argument
+            spec_dim=1, 
+            embedding_dim=512, 
+            depth=5, 
+            downsample_factor=4,
+            resnet_blocks=2, 
+            attn_blocks=4, 
+            num_attn_heads=4, 
+            base_channels=32,
+            dropout=0, 
+            kernel_size=5, 
+            distribute_zero_label=False
+        )
 
-    # Initialize classifier model
-    classifier = AudioMiniEncoderWithClassifierHead(
-        num_classes=2, spec_dim=1, embedding_dim=512, depth=5, downsample_factor=4,
-        resnet_blocks=2, attn_blocks=4, num_attn_heads=4, base_channels=32,
-        dropout=0, kernel_size=5, distribute_zero_label=False
-    )
+        # Load pretrained model weights
+        if not os.path.exists('classifier.pth'):
+            raise FileNotFoundError("Pretrained model file 'classifier.pth' not found.")
+        state_dict = torch.load('classifier.pth', map_location=torch.device('cpu'))
+        classifier.load_state_dict(state_dict)
 
-    # Load pretrained model weights
-    state_dict = torch.load('classifier.pth', map_location=torch.device('cpu'))
-    classifier.load_state_dict(state_dict)
+        # Process the audio clip
+        clip = clip.cpu().unsqueeze(0)  # Move to CPU and add batch dimension
 
-    # Process the audio clip
-    clip = clip.cpu().unsqueeze(0)  # Move to CPU and add batch dimension
-
-    # Perform classification and return AI-generated probability
-    results = F.softmax(classifier(clip), dim=-1)
-    return results[0][0].item()  # Convert tensor to float
+        # Perform classification and return AI-generated probability
+        results = F.softmax(classifier(clip), dim=-1)
+        return results[0][0].item()  # Convert tensor to float
+    except Exception as e:
+        st.error(f"Error during classification: {str(e)}")  # Display error in Streamlit
+        print(f"Error during classification: {str(e)}")  # Print error in console
+        return None
 
 
 st.set_page_config(layout="wide")
@@ -102,16 +113,20 @@ def main():
                     return
 
                 result = classify_audio_clip(audio_clip)
-                st.info(f"AI-Generated Probability: {result:.2f}")
-                st.success(f"The uploaded audio is {result * 100:.2f}% likely to be AI-generated.")
+                if result is not None:
+                    st.info(f"AI-Generated Probability: {result:.2f}")
+                    st.success(f"The uploaded audio is {result * 100:.2f}% likely to be AI-generated.")
+                else:
+                    st.error("An error occurred during audio classification.")
 
             with col2:
                 st.info("Uploaded audio is below")
                 st.audio(uploaded_file)
 
                 # Display audio waveform
+                normalized_audio = audio_clip / torch.max(torch.abs(audio_clip))
                 fig = px.line()
-                fig.add_scatter(x=list(range(len(audio_clip.squeeze()))), y=audio_clip.squeeze())
+                fig.add_scatter(x=list(range(len(normalized_audio.squeeze()))), y=normalized_audio.squeeze().numpy())
                 fig.update_layout(
                     title="Audio Waveform",
                     xaxis_title="Time",
